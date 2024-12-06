@@ -24,7 +24,6 @@ class Asset(BaseModel):
     asset_id: str  
     asset_name: str
     user_id: int
-    username: str
     asset_condition: str
     asset_location: str
 
@@ -35,22 +34,23 @@ class UpdateAsset(BaseModel):
     asset_location: Optional[str]
 
 class User(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     username: str
-    hash_password: str
-    role: str
+    password: str
+    role_id: int
     email: str
 
 class NewUser(BaseModel):
     username: str
     password: str
     email: str
+    role_id: Optional[int]
 
 class UpdateUser(BaseModel):
     user_id: int
     username: str
-    email: Optional[str] = None
-    role: Optional[str] = None
+    email: str
+    password: str
 
 class Token(BaseModel):
     access_token: str
@@ -59,7 +59,7 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     email:str
-    role:str
+    role_id :int
     user_id: Optional[str] = None
 
 class TokenRequest(BaseModel):
@@ -136,7 +136,7 @@ def get_user_from_db(email:str):
     try:
         connection=get_connect()
         conn=connection.cursor(dictionary=True)
-        conn.execute("select * from user u join role r on u.user_id = r.user_id where u.email=%s",(email,))
+        conn.execute("select * from user where email=%s",(email,))
         user= conn.fetchone()
         conn.close()
         connection.close()
@@ -161,6 +161,10 @@ def get_user_by_email(email:str):
         raise HTTPException(status_code = 400, detail = "invalid mail")
     return mail
 
+def get_role_by_email(email):
+    user = get_user_from_db(email)
+    return user["role_id"]
+
 #sends the mail
 async def send_mail(user:User,email:str):
     mail= get_user_by_email(email)
@@ -184,18 +188,17 @@ def get_current_user(token:str = Depends(auth_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email:str = payload.get("email")
-        role:str = payload.get("role")
+        role_id:str = payload.get("role_id")
         user_id:int = payload.get("user_id")
-        hash_password: str = payload.get("hash_password")
-        
-        if email is None or role is None:
+        password: str = payload.get("password")
+
+        if email is None or role_id is None:
             raise HTTPException(status_code = 401, detail = "Credentials not enough")
-        return TokenData(email = email, role = role)
+        return TokenData(email = email, role_id = role_id)
     
     except JWTError as err:
         logger.error(f"Error occurred: {str(err)}")
         raise HTTPException(status_code = 401,detail = "Invalid credentials")
-    
 
 #home page
 @app.get("/")
@@ -206,13 +209,20 @@ def intro():
 @app.post("/token")
 async def login_for_access_token(form_data:OAuth2PasswordRequestForm=Depends()):
     user = get_user_from_db(form_data.username)
-    if not user or not verify_password(form_data.password, user["hash_password"]):
+    if not user or not verify_password(form_data.password, user["password"]):
         raise HTTPException(status_code = 401, detail = "invalid credentials")
     
+    role=" "
+    role_id = user["role_id"]
+    if role_id == 1:
+        role = "admin"
+    else:
+        role = "user"
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     time = access_token_expires + datetime.utcnow()
-    access_token= create_access_token(data={"email":user["email"], "role":user["role"], "user_id":user["user_id"]}, expires_delta = access_token_expires)
-    return {"access_token":access_token, "bearer_type":"bearer", "token_expiry_time":time, "role":user["role"]}
+    access_token= create_access_token(data={"email":user["email"], "role": role,"role_id":user["role_id"], "user_id":user["user_id"]}, expires_delta = access_token_expires)
+    return {"access_token":access_token, "bearer_type":"bearer", "token_expiry_time":time, "role": role}
 
 #route for validating tokens
 @app.post("/validate-token")
@@ -244,21 +254,23 @@ async def validate_token(request:TokenRequest ,current_user:TokenData = Depends(
 #user asset details accessible by user and admin
 @app.get("/user-asset-detail/{user_id}")
 async def get_your_details(user_id:int, current_user: TokenData=Depends(get_current_user)):
-    print(f"Current user ID: {current_user.user_id}")
 
-    if current_user.role=="admin" or current_user.user_id == user_id:
+    user = get_user_from_db(current_user.email)["user_id"]    
+    if current_user.role_id == 1 or user == user_id:
         try:
             connection = get_connect()
             conn = connection.cursor(dictionary=True)
             conn.execute("select u.user_id, u.username, a.asset_id, a.asset_name, a.asset_condition, a.asset_location from user u join asset a on u.user_id = a.user_id where u.user_id = %s", (user_id,))
             result = conn.fetchall()
+            if not result:
+                return {"message":"user not found"}
+                raise HTTPException(status_code= 404, detail = "user not found")
             user_details = {}
             for entry in result:
                 user_id = entry["user_id"]
                 asset_id = entry["asset_id"]
                 if user_id not in user_details:
                     user_details[user_id]={
-                        "user_id":user_id,
                         "username":entry["username"],
                         "assets":[]
                     }
@@ -279,7 +291,7 @@ async def get_your_details(user_id:int, current_user: TokenData=Depends(get_curr
             return user_details[user_id]
 
         except Exception as err:
-            print(logger.error(f"Error occurred: {str(err)}"))
+            return logger.error(f"Error occurred: {str(err)}")
     else:
         raise HTTPException(status_code=403,detail="only authorised users can access")  
 
@@ -290,8 +302,7 @@ class ResetPassword(BaseModel):
 #reset password done by authorised user and admin
 @app.post("/reset-password")
 async def reset_password(request: ResetPassword, current_user: TokenData=Depends(get_current_user)):
-    if current_user.role == "admin" or current_user.email == request.email:
-        print("current_user", current_user.email, current_user.role)
+    if current_user.role_id == 1 or current_user.email == request.email:
         try:
             connection = get_connect()
             conn = connection.cursor(dictionary=True)
@@ -301,7 +312,7 @@ async def reset_password(request: ResetPassword, current_user: TokenData=Depends
             if not existing_user:
                 raise HTTPException(status_code=404, detail="user not found")
             hash_password=create_password(request.new_password)
-            conn.execute("update user set hash_password= %s where email= %s", (hash_password, request.email))
+            conn.execute("update user set password= %s where email= %s", (hash_password, request.email))
             connection.commit()
             conn.close()
             connection.close()
@@ -315,106 +326,125 @@ async def reset_password(request: ResetPassword, current_user: TokenData=Depends
 #uploading asset csv can only be done by admin
 @app.post("/upload-csv-asset/")
 async def upload_csv_for_asset(file: UploadFile = File(...), current_user: TokenData = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code = 403, detail = "Only admins can perform this operation.")
-    
-    dict_list = []
-    contents = await file.read()
-    file_str = contents.decode("utf-8")
-    csv_file = StringIO(file_str)
-    csv_reader = csv.reader(csv_file, delimiter=";")
+    if current_user.role_id == 1:
+        dict_list = []
+        contents = await file.read()
+        file_str = contents.decode("utf-8")
+        csv_file = StringIO(file_str)
+        csv_reader = csv.reader(csv_file, delimiter=";")
 
-    for row in csv_reader:
-        if len(row) == 6:
-            asset_id = row[0]
-            asset_name = row[1]
-            user_id = row[2]
-            asset_condition = row[4]
-            asset_location = row[5]
-            
-            if not isinstance(asset_id, str) or not isinstance(asset_name, str) or not isinstance(asset_condition, str) or not isinstance(asset_location, str):
-                raise HTTPException(status_code=400, detail=f"asset_id '{asset_id}',asset_name, username, asset_condition and asset_location must be strings.")
+        for row in csv_reader:
+            if len(row) == 5:
+                asset_id = row[0]
+                asset_name = row[1]
+                user_id = row[2]
+                asset_condition = row[3]
+                asset_location = row[4]
+                
+                if not isinstance(asset_id, str) or not isinstance(asset_name, str) or not isinstance(asset_condition, str) or not isinstance(asset_location, str):
+                    raise HTTPException(status_code=400, detail=f"asset_id '{asset_id}',asset_name, username, asset_condition and asset_location must be strings.")
 
-            try:
-                user_id = int(user_id)
-            except ValueError as err:
-                logger.error(f"Error occurred: {str(err)}")
-                raise HTTPException(status_code=400, detail=f"Invalid user_id '{user_id}' in CSV file. user_id must be an integer.")
-            
-            dict_list.append({
-                "asset_id": asset_id, "asset_name": asset_name, "user_id": user_id,
-                "asset_condition": asset_condition, "asset_location": asset_location
-            })
-        else:
-            print(f"Skipping malformed row: {row}")
-    
-    connection = get_connect()
-    conn = connection.cursor()
-
-    for item in dict_list:
-        query = "insert into asset values (%s, %s, %s, %s, %s)"
-        values = (item["asset_id"], item["asset_name"], item["user_id"], item["asset_condition"], item["asset_location"])
-        conn.execute(query, values)
-
-    connection.commit()
-    conn.close()
-    connection.close()
-
-#uploading user csv can only be done by admin
-@app.post("/upload-csv-user/")
-async def upload_csv_for_user(file:UploadFile=File(...),current_user: TokenData=Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code = 403, detail= "Only admins can do this")
-    
-    dict_list=[]
-    contents = await file.read()
-    file_str = contents.decode("utf-8")
-    csv_file = StringIO(file_str)
-    csv_reader = csv.reader(csv_file, delimiter=";")
-
-    for row in csv_reader:
-        if len(row) == 5:
-            user_id = row[0]
-            username = row[1]
-            hash_password = row[2]
-            role = row[3]
-            email = row[4]
-
-            if not isinstance(username,str) or not isinstance(hash_password,str) or not isinstance(role, str) or not isinstance(email, str):
-                raise HTTPException(status_code=400, detail="username, hash_password, role must be strings")
-            
-            try:
-                user_id = int(user_id)
-            except ValueError as e:
-                logger.error(f"Error occurred: {str(e)}")
-                raise HTTPException(status_code= 400, detail=f"user_id '{user_id}' must be an integer")
-            
-            hash_password=create_password(hash_password)
-            dict_list.append({
-                "user_id":user_id, "username":username,
-                "hash_password":create_password(hash_password),
-                "role":role, "email":email
-            })
-        else:
-            print(f"Skipping malformed row:'{row}'")
-
-        connection= get_connect()
-        conn= connection.cursor()
+                try:
+                    user_id = int(user_id)
+                except ValueError as err:
+                    logger.error(f"Error occurred: {str(err)}")
+                    raise HTTPException(status_code=400, detail=f"Invalid user_id '{user_id}' in CSV file. user_id must be an integer.")
+                
+                dict_list.append({
+                    "asset_id": asset_id, "asset_name": asset_name, "user_id": user_id,
+                    "asset_condition": asset_condition, "asset_location": asset_location
+                })
+            else:
+                print(f"Skipping malformed row: {row}")
+        
+        connection = get_connect()
+        conn = connection.cursor()
 
         for item in dict_list:
-            query= "insert into user values(%s, %s, %s, %s, %s)"
-            value= (item["user_id"], item["username"], item["hash_password"], item["role"], item["email"])
-            conn.execute(query, value)
-        
+            query = "insert into asset values (%s, %s, %s, %s, %s)"
+            values = (item["asset_id"], item["asset_name"], item["user_id"], item["asset_condition"], item["asset_location"])
+            conn.execute(query, values)
+
         connection.commit()
         conn.close()
         connection.close()
+    else:
+        return {"message":"only admin can access"}
+
+#uploading user csv can only be done by admin
+@app.post("/upload-csv-user/")
+async def upload_csv_for_user(file: UploadFile = File(...),current_user: TokenData = Depends(get_current_user)):
+    if current_user.role_id == 1: 
+        dict_list = []
+        contents = await file.read()
+        file_str = contents.decode("utf-8")
+        csv_file = StringIO(file_str)
+
+        csv_reader = csv.reader(csv_file, delimiter=";")
+        headers = ["user_id", "username", "email", "password", "role_id"]
+
+        for row in csv_reader:
+            if len(row) == 5:
+                row_dict = dict(zip(headers, row))
+                
+                user_id = row_dict["user_id"]
+                username = row_dict["username"]
+                email = row_dict["email"]
+                password = row_dict["password"]
+                role_id = row_dict["role_id"]
+
+                logger.debug(f"Processing row: {row_dict}")
+
+                if not all(isinstance(val, str) for val in [username, password, email, role_id]):
+                    logger.error(f"Invalid data types found: username={username}, password={password}, email={email}, role_id={role_id}")
+                    raise HTTPException(status_code=400, detail="username, password, email, and role_id must be strings")
+
+                try:
+                    user_id = int(user_id)
+                except ValueError as e:
+                    logger.error(f"Error occurred: {str(e)}")
+                    raise HTTPException(status_code=400, detail=f"user_id '{user_id}' must be an integer")
+
+                hashed_password = create_password(password)
+
+                dict_list.append({
+                    "user_id": user_id,
+                    "username": username,
+                    "email": email,
+                    "role_id": role_id,
+                    "password": hashed_password
+                })
+            else:
+                logger.warning(f"Skipping malformed row: {row}")
+
+        if dict_list:
+            connection = get_connect()
+            try:
+                with connection.cursor() as cursor:
+                    query = "INSERT INTO user (user_id, username, email, role_id, password) VALUES (%s, %s, %s, %s, %s)"
+                    values = [(item["user_id"], item["username"], item["email"], item["role_id"], item["password"]) for item in dict_list]
+                    cursor.executemany(query, values)
+                connection.commit()
+                logger.info(f"Inserted {len(dict_list)} users.")
+            except Exception as e:
+                logger.error(f"Database error: {str(e)}")
+                connection.rollback()
+                raise HTTPException(status_code=500, detail="Database error occurred during user insertion.")
+            finally:
+                connection.close()
+        else:
+            raise HTTPException(status_code=400, detail="No valid data found in CSV.")
+
+        return {"message": f"Successfully uploaded {len(dict_list)} users."}
+    else:
+        return {"message":" only admins can access"}
+
 
 #details of every user only accesible by admin
 @app.get("/user")
 def get_all_users(current_user:TokenData = Depends(get_current_user)):
-    print("current_user", current_user.email, current_user.role)
-    if current_user.role != "admin":
+
+    if current_user.role_id != 1:
         raise HTTPException(status_code = 403, detail = "Only admin can access")
     
     try:
@@ -434,7 +464,7 @@ def get_all_users(current_user:TokenData = Depends(get_current_user)):
 #admin can see all asset details
 @app.get("/asset")
 def get_all_assets(current_user:TokenData = Depends(get_current_user)):
-    if current_user.role != "admin":
+    if current_user.role_id != 1:
         raise HTTPException(status_code = 403, detail = "Only admin can access")
     
     try:
@@ -447,7 +477,6 @@ def get_all_assets(current_user:TokenData = Depends(get_current_user)):
             user_id = entry["user_id"]
             if user_id not in user_details:
                 user_details[user_id] = {
-                    "user_id": user_id,
                     "assets":[]
                 }
             asset_details = {
@@ -469,7 +498,7 @@ def get_all_assets(current_user:TokenData = Depends(get_current_user)):
 #only admin can see user and asset details combined
 @app.get("/user-and-asset-detail")
 async def get_user_and_asset(current_user:TokenData=Depends(get_current_user)):
-    if current_user.role!="admin":
+    if current_user.role_id != 1:
         raise  HTTPException(status_code=403,detail="only admin can access")
     
     try:
@@ -482,7 +511,6 @@ async def get_user_and_asset(current_user:TokenData=Depends(get_current_user)):
             user_id = entry["user_id"]
             if user_id not in user_details:
                 user_details[user_id] = {
-                    "user_id": user_id,
                     "username": entry["username"],
                     "assets": []
                 }
@@ -503,70 +531,81 @@ async def get_user_and_asset(current_user:TokenData=Depends(get_current_user)):
     
 #creating users can be only done by admin
 @app.post("/create-user")
-async def create_user(user:User, current_user:TokenData = Depends(get_current_user)):
-    if current_user.role != "admin":
+async def create_user(users:List[User], current_user:TokenData = Depends(get_current_user)):
+    if current_user.role_id != 1:
         raise HTTPException(status_code = 403,detail = "only admin can access")
     
-    user.hash_password = create_password(user.hash_password)
+    for user in users:
+        user.password = create_password(user.password)
+        user.role_id = 2
 
     try:
         connection= get_connect()
         conn= connection.cursor(dictionary = True)
-        conn.execute("insert into user values(%s, %s, %s, %s)",(user.username,user.hash_password,user.role,user.email))
+        for user in users:
+            conn.execute("insert into user values(%s, %s, %s, %s, %s)",(user.user_id, user.username, user.email, user.password, user.role_id))
+
         connection.commit()
         conn.close()
         connection.close()
         return {"message":"user created"}
 
     except Exception as e:
+        logger.error(f"Error occurred while creating user: {str(e)}")
         raise HTTPException(status_code = 500, detail = "error occured")
 
 #creating asset can only be done by admin
 @app.post("/create-asset")
-async def create_asset(asset:Asset,current_user:TokenData = Depends(get_current_user)):
-    if current_user.role != "admin":
+async def create_asset(assets:List[Asset],current_user:TokenData = Depends(get_current_user)):
+    if current_user.role_id != 1:
         raise HTTPException(status_code = 403,detail = "only admin can access")
-    
+            
     try:
         connection= get_connect()
         conn=connection.cursor(dictionary = True)
-        conn.execute("insert into asset values(%s, %s, %s, %s, %s)",(asset.asset_id, asset.asset_name, asset.user_id, asset.asset_condition, asset.asset_location))
+        for asset in assets:
+            conn.execute("insert into asset values(%s, %s, %s, %s, %s)",(asset.asset_id, asset.asset_name, asset.user_id, asset.asset_condition, asset.asset_location))
+        
         connection.commit()
         conn.close()
         connection.close()
         return {"message":"asset created"}
 
     except Exception as e:
-        (print(f"Error occurred: {str(e)}"))
+        logger.error(f"Error occurred: {str(e)}")
         raise HTTPException(status_code = 500, detail = "an error occured")
 
 #updating user details can only be done by admin
 @app.put("/user-update", response_model = UpdateUser)
 async def update_user(user:UpdateUser, current_user:TokenData = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code = 403,detail = "only admin can access")
-    
-    try:
-        connection=get_connect()
-        conn= connection.cursor(dictionary=True)
-        conn.execute("select * from user where user_id = %s",( user.user_id,))
-        existing_user = conn.fetchone()
+    registered_user = get_user_from_db(user.email)
+    registered_user = registered_user["user_id"]
 
-        if not existing_user:
-            raise HTTPException(status_code=404,detail="user not found")
-        conn.execute("update user set username = %s,email = %s,role = %s where user_id = %s" ,(user.username, user.email, user.role, user.user_id))
-        connection.commit()
-        conn.close()
-        connection.close()
-        return {**user.dict(), "user_id":user.user_id}
+    if current_user.role_id == 1 or registered_user == user.user_id:
+        try:
+            connection=get_connect()
+            conn= connection.cursor(dictionary=True)
+            conn.execute("select * from user where user_id = %s",( user.user_id,))
+            existing_user = conn.fetchone()
 
-    except Exception as err:
-        raise HTTPException(status_code = 500,detail = "error occurred")
+            hash_password = create_password(user.password)
+            if not existing_user:
+                raise HTTPException(status_code=404,detail="user not found")
+            conn.execute("update user set username = %s,email = %s, password = %s where user_id = %s" ,(user.username, user.email, hash_password, user.user_id))
+            connection.commit()
+            conn.close()
+            connection.close()
+            return {**user.dict(), "user_id":user.user_id}
+
+        except Exception as err:
+            raise HTTPException(status_code = 500,detail = "error occurred")
+        
+    raise HTTPException(status_code = 403,detail = "only admin or loggedin user can access")
     
 #updating assets can only be done by admin    
 @app.put("/asset-update", response_model = UpdateAsset)
 async def update_asset(asset:UpdateAsset, current_user:TokenData = Depends(get_current_user)):
-    if current_user.role != "admin":
+    if current_user.role_id != 1:
         raise HTTPException(status_code = 403,detail = "only admin can access")
     
     try:
@@ -589,7 +628,7 @@ async def update_asset(asset:UpdateAsset, current_user:TokenData = Depends(get_c
 #user deletion can only be done by admin
 @app.delete("/user-delete/")
 async def delete_user(user_id:int, current_user:TokenData = Depends(get_current_user)):
-    if current_user.role != "admin":
+    if current_user.role_id != 1:
         raise HTTPException(status_code = 403,detail = "only admin can access")
     
     try:
@@ -618,7 +657,7 @@ async def delete_user(user_id:int, current_user:TokenData = Depends(get_current_
 #asset deletion can only be done by admin
 @app.delete("/asset-delete")
 async def delete_asset(asset_id:str, current_user:TokenData = Depends(get_current_user)):
-    if current_user.role != "admin":
+    if current_user.role_id != 1:
         raise HTTPException(status_code = 403, detail = "only admin can access")
     
     try:
@@ -670,9 +709,11 @@ async def create_new_password(email:str, verification_token:str, new_password:st
         logger.error(f"Error occured:{str(err)}")
         raise HTTPException(status_code=500, detail="Error occured")
 
+#registering new users
 @app.post("/register-user")
 async def register_user(user:NewUser):
     user.password = create_password(user.password)
+    user.role_id = 2
     try:
         connection = get_connect()
         conn = connection.cursor(dictionary = True)
@@ -681,12 +722,13 @@ async def register_user(user:NewUser):
         if existing_user:
             raise HTTPException(status_code = 400, detail = "user already exists")
         
-        conn.execute("insert into user(username, hash_password, email) values(%s, %s, %s)",(user.username, user.password, user.email))
+        conn.execute("insert into user(username, password, email, role_id) values(%s, %s, %s, %s)",(user.username, user.password, user.email, user.role_id))
         connection.commit()
         conn.close()
         connection.close()
     
-    except Exception:
+    except Exception as err:
+        logger.error(f"error occured: {str(err)}")
         raise HTTPException(status_code = 500, detail = "server error")
     
     return {"message": "registration successful"}
