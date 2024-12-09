@@ -30,8 +30,10 @@ class Asset(BaseModel):
 class UpdateAsset(BaseModel):
     asset_id: str
     user_id: Optional[int]
-    asset_name: Optional[str]
-    asset_location: Optional[str]
+    asset_name: Optional[str] = None
+    asset_condition: Optional[str] = None
+    asset_location: Optional[str] = None
+    operation: Optional[str] = None
 
 class User(BaseModel):
     user_id: Optional[int] = None
@@ -39,6 +41,11 @@ class User(BaseModel):
     password: str
     role_id: int
     email: str
+
+class CreateUser(BaseModel):
+    username: str
+    email: str
+    password: str
 
 class NewUser(BaseModel):
     username: str
@@ -531,19 +538,18 @@ async def get_user_and_asset(current_user:TokenData=Depends(get_current_user)):
     
 #creating users can be only done by admin
 @app.post("/create-user")
-async def create_user(users:List[User], current_user:TokenData = Depends(get_current_user)):
+async def create_user(users:List[CreateUser], current_user:TokenData = Depends(get_current_user)):
     if current_user.role_id != 1:
         raise HTTPException(status_code = 403,detail = "only admin can access")
     
     for user in users:
         user.password = create_password(user.password)
-        user.role_id = 2
 
     try:
         connection= get_connect()
         conn= connection.cursor(dictionary = True)
         for user in users:
-            conn.execute("insert into user values(%s, %s, %s, %s, %s)",(user.user_id, user.username, user.email, user.password, user.role_id))
+            conn.execute("insert into user(username, email, password, role_id) values( %s, %s, %s, %s)",(user.username, user.email, user.password, 2))
 
         connection.commit()
         conn.close()
@@ -554,17 +560,28 @@ async def create_user(users:List[User], current_user:TokenData = Depends(get_cur
         logger.error(f"Error occurred while creating user: {str(e)}")
         raise HTTPException(status_code = 500, detail = "error occured")
 
+class AssetDetails(BaseModel):
+    asset_name: str
+    asset_condition: str
+    asset_location: str
+
+class CreateAsset(BaseModel):
+    user_id: int
+    assets: List[AssetDetails]
+
 #creating asset can only be done by admin
 @app.post("/create-asset")
-async def create_asset(assets:List[Asset],current_user:TokenData = Depends(get_current_user)):
+async def create_asset(asset:CreateAsset, current_user:TokenData = Depends(get_current_user)):
     if current_user.role_id != 1:
         raise HTTPException(status_code = 403,detail = "only admin can access")
             
     try:
         connection= get_connect()
         conn=connection.cursor(dictionary = True)
-        for asset in assets:
-            conn.execute("insert into asset values(%s, %s, %s, %s, %s)",(asset.asset_id, asset.asset_name, asset.user_id, asset.asset_condition, asset.asset_location))
+        user_id = asset.user_id
+        for l in asset.assets:
+            values = ( l.asset_name, asset.user_id, l.asset_condition, l.asset_location)
+            conn.execute("insert into asset(asset_name, user_id, asset_condition, asset_location) values(%s, %s, %s, %s)", values)
         
         connection.commit()
         conn.close()
@@ -598,31 +615,39 @@ async def update_user(user:UpdateUser, current_user:TokenData = Depends(get_curr
             return {**user.dict(), "user_id":user.user_id}
 
         except Exception as err:
-            raise HTTPException(status_code = 500,detail = "error occurred")
+            raise HTTPException(status_code = 500, detail = "error occurred")
         
-    raise HTTPException(status_code = 403,detail = "only admin or loggedin user can access")
-    
+    raise HTTPException(status_code = 403, detail = "only admin or loggedin user can access")
+        
 #updating assets can only be done by admin    
-@app.put("/asset-update", response_model = UpdateAsset)
-async def update_asset(asset:UpdateAsset, current_user:TokenData = Depends(get_current_user)):
+@app.put("/asset-update")
+async def update_asset(assets:List[UpdateAsset], current_user:TokenData = Depends(get_current_user)):
     if current_user.role_id != 1:
-        raise HTTPException(status_code = 403,detail = "only admin can access")
+        raise HTTPException(status_code = 403, detail = "only admin can access")
     
     try:
+        
         connection=get_connect()
         conn= connection.cursor(dictionary=True)
-        conn.execute("select * from asset where asset_id = %s", (asset.asset_id,))
-        existing_user= conn.fetchone()
+        updated = []
+        for asset in assets:
+            conn.execute("select * from asset where asset_id = %s", (asset.asset_id,))
+            existing = conn.fetchone()
 
-        if not existing_user:
-            raise HTTPException(status_code = 404,detail="asset not found")
-        conn.execute("update asset set user_id = %s, asset_name = %s, asset_location = %s where asset_id= %s" ,(asset.user_id, asset.asset_name, asset.asset_location, asset.asset_id))
+            if not existing:
+                raise HTTPException(status_code = 404, detail="asset not found")
+            
+            value = (asset.user_id, asset.asset_name, asset.asset_location, asset.asset_condition, asset.asset_id)
+            conn.execute("update asset set user_id = %s, asset_name = %s, asset_location = %s, asset_condition = %s where asset_id= %s" ,value)
+            updated.append(asset)
+        
         connection.commit()
         conn.close()
         connection.close()
-        return asset
+        return updated
     
     except Exception as err:
+        logging.error(f"Error updating assets: {err}")
         raise HTTPException(status_code = 500,detail = "error occurred")
 
 #user deletion can only be done by admin
@@ -732,3 +757,64 @@ async def register_user(user:NewUser):
         raise HTTPException(status_code = 500, detail = "server error")
     
     return {"message": "registration successful"}
+
+class Update(BaseModel):
+    asset_id: Optional[int] = None
+    asset_name: Optional[str] = None
+    asset_condition: Optional[str] = None
+    asset_location: Optional[str] = None
+
+class Cud(BaseModel):
+    user_id: int
+    assets: List[Update]
+
+def get_asset_from_db(asset_id: str):
+    connection = get_connect()
+    conn = connection.cursor(dictionary = True)
+    conn.execute("select * from asset where asset_id = %s", (asset_id,))
+    result = conn.fetchone()
+    conn.close()
+    connection.close()
+    return result
+
+@app.put("/cud")
+async def cud(cud: Cud, current_user: TokenData = Depends(get_current_user)):
+    if current_user.role_id != 1:
+        raise HTTPException(status_code=403, detail="Admins can access")
+    
+    present_assent_id = [asset.asset_id for asset in cud.assets if asset.asset_id and asset.asset_id != 0]
+
+    try:
+        connection = get_connect()
+        conn = connection.cursor(dictionary=True)
+
+        for asset in cud.assets:
+            try:
+                if asset.asset_id and asset.asset_name and asset.asset_condition and asset.asset_location:
+                    existing = get_asset_from_db(asset.asset_id)
+                    if existing:
+                        value = (asset.asset_name, asset.asset_condition, asset.asset_location, asset.asset_id)
+                        conn.execute("update asset set asset_name = %s, asset_condition = %s, asset_location = %s where asset_id = %s", value)
+                    elif asset.asset_id == 0:
+                        value = (asset.asset_name, cud.user_id, asset.asset_condition, asset.asset_location)
+                        conn.execute("insert into asset (asset_name, user_id, asset_condition, asset_location) values (%s, %s, %s, %s)", value)
+
+                elif asset.asset_id and asset.asset_id not in present_assent_id:
+                    existing = get_asset_from_db(asset.asset_id)
+                    if existing:
+                        conn.execute("delete from asset where asset_id = %s", (asset.asset_id,))
+
+            except Exception as e:
+                connection.rollback()
+                raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+        connection.commit()
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while connecting to the database: {str(e)}")
+
+    finally:
+        conn.close()
+        connection.close()
+
+    return {"message": "updated successfully"}
