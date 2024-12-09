@@ -782,39 +782,40 @@ async def cud(cud: Cud, current_user: TokenData = Depends(get_current_user)):
     if current_user.role_id != 1:
         raise HTTPException(status_code=403, detail="Admins can access")
     
-    present_assent_id = [asset.asset_id for asset in cud.assets if asset.asset_id and asset.asset_id != 0]
+    present_assent_id = [asset.asset_id for asset in cud.assets if asset.asset_id != 0]
 
     try:
         connection = get_connect()
         conn = connection.cursor(dictionary=True)
+        conn.execute("select asset_id from asset where user_id = %s", (cud.user_id,))
+        user_assets = [row['asset_id'] for row in conn.fetchall()]
+
+        assets_to_delete = set(user_assets) - set(present_assent_id)
 
         for asset in cud.assets:
-            try:
-                if asset.asset_id and asset.asset_name and asset.asset_condition and asset.asset_location:
+            if asset.asset_id != 0:  
+                if asset.asset_name and asset.asset_condition and asset.asset_location:
                     existing = get_asset_from_db(asset.asset_id)
                     if existing:
                         value = (asset.asset_name, asset.asset_condition, asset.asset_location, asset.asset_id)
                         conn.execute("update asset set asset_name = %s, asset_condition = %s, asset_location = %s where asset_id = %s", value)
-                    elif asset.asset_id == 0:
-                        value = (asset.asset_name, cud.user_id, asset.asset_condition, asset.asset_location)
-                        conn.execute("insert into asset (asset_name, user_id, asset_condition, asset_location) values (%s, %s, %s, %s)", value)
+            elif asset.asset_id == 0: 
+                if asset.asset_name and asset.asset_condition and asset.asset_location:
+                    value = (asset.asset_name, cud.user_id, asset.asset_condition, asset.asset_location)
+                    conn.execute("insert into asset (asset_name, user_id, asset_condition, asset_location) values (%s, %s, %s, %s)", value)
 
-                elif asset.asset_id and asset.asset_id not in present_assent_id:
-                    existing = get_asset_from_db(asset.asset_id)
-                    if existing:
-                        conn.execute("delete from asset where asset_id = %s", (asset.asset_id,))
-
-            except Exception as e:
-                connection.rollback()
-                raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        for asset_id in assets_to_delete:
+            conn.execute("delete from asset where asset_id = %s and user_id = %s", (asset_id, cud.user_id))
 
         connection.commit()
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred while connecting to the database: {str(e)}")
+        connection.rollback()
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
     finally:
         conn.close()
         connection.close()
 
-    return {"message": "updated successfully"}
+    return {"message": "Assets updated successfully"}
+
