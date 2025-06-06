@@ -78,7 +78,7 @@ class Email(BaseModel):
 #mail initialisation
 conf= ConnectionConfig(
     MAIL_USERNAME="csesecondyr2257@gmail.com",
-    MAIL_PASSWORD="yourpasswordisincorrect",
+    MAIL_PASSWORD="-",
     MAIL_FROM="csesecondyr2257@gmail.com",
     MAIL_PORT=587,
     MAIL_SERVER="smtp.gmail.com",
